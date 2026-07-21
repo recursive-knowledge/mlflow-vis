@@ -1813,6 +1813,17 @@ wheels = [
 ]
 
 [[package]]
+name = "rk-mlflow-client"
+version = "0.1.0"
+source = { editable = "client" }
+dependencies = [
+    { name = "mlflow-skinny" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "mlflow-skinny", specifier = ">=2.9" }]
+
+[[package]]
 name = "rk-mlflow-server"
 version = "0.1.0"
 source = { virtual = "." }
@@ -1828,6 +1839,7 @@ ops = [
     { name = "mlflow-skinny" },
     { name = "pyjwt" },
     { name = "requests" },
+    { name = "rk-mlflow-client" },
 ]
 
 [package.metadata]
@@ -1843,6 +1855,7 @@ ops = [
     { name = "mlflow-skinny", specifier = "==3.14.0" },
     { name = "pyjwt", specifier = ">=2.9" },
     { name = "requests", specifier = ">=2.32" },
+    { name = "rk-mlflow-client", editable = "client" },
 ]
 
 [[package]]

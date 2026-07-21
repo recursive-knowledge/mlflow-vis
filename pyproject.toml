@@ -30,7 +30,17 @@ ops = [
     "pyjwt>=2.9",
     "requests>=2.32",
     "mlflow-skinny==3.14.0",
+    # Not optional for `make test-tunnel`: it registers the request-header
+    # provider that attaches CF-Access-* to every MLflow call. Without it the
+    # test exercises a different code path than a real node does, gets the
+    # Access login page, and fails on parsing HTML as JSON.
+    "rk-mlflow-client",
 ]
 
 [tool.uv]
 package = false
+
+[tool.uv.sources]
+# Editable: the node-side package lives in this repo, so the test always
+# runs against the client the nodes are told to install.
+rk-mlflow-client = { path = "client", editable = true }
