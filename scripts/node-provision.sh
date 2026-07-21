@@ -25,6 +25,18 @@ fi
 ssh-keygen -t ed25519 -N "" -C "rk-mlflow-${node}" -f "$keyfile" >/dev/null
 chmod 600 "$keyfile"
 
+# The install line has to name a real remote — a bundle telling its recipient
+# to install from a placeholder is worse than one that omits the step. Derived
+# from origin rather than hardcoded so it cannot drift if the repo moves.
+origin=$(git remote get-url origin 2>/dev/null || true)
+case "$origin" in
+  # scp-style (git@host:org/repo) needs the colon turned into a slash before
+  # it is a valid URL for pip/uv.
+  git@*)     install_line="#   uv pip install 'git+ssh://${origin/://}#subdirectory=client'" ;;
+  https://*) install_line="#   uv pip install 'git+${origin}#subdirectory=client'" ;;
+  *)         install_line="#   uv pip install '/path/to/mlflow-vis/client'   # no git remote configured" ;;
+esac
+
 cat > "$bundle" <<EOF
 # ---------------------------------------------------------------------------
 # rk-mlflow credentials for: ${node}
@@ -36,15 +48,14 @@ cat > "$bundle" <<EOF
 #
 # Install:
 #   source ${node}.env
-#   uv pip install 'git+ssh://git@…/mlflow-vis#subdirectory=client'
+${install_line}
 # ---------------------------------------------------------------------------
 
 # --- telemetry (through the tunnel) ---
 export MLFLOW_TRACKING_URI="https://${MLFLOW_HOSTNAME}"
 
-# Cloudflare Access service token — create one named '${node}' under
-# Zero Trust > Access > Service Auth, add it to the MLflow application's
-# Service Auth policy, then paste both halves here.
+# Cloudflare Access service token. Filled in by \`make node-token NODE=${node}\`;
+# if these are still empty, that step has not been run yet.
 export CF_ACCESS_CLIENT_ID=""
 export CF_ACCESS_CLIENT_SECRET=""
 
@@ -73,10 +84,11 @@ provisioned '${node}'
   ${keyfile}(.pub)
 
 still to do:
-  1. Create a Cloudflare Access service token named '${node}' and paste the
-     Client ID + Secret into ${bundle}.
-     (Zero Trust > Access > Service Auth, then add it to the MLflow app's
-      Service Auth policy.)
+  1. make node-token NODE=${node}         # Access service token, into the bundle
+     (Needs CLOUDFLARE_API_TOKEN in env/server.env. Without it, create the
+      token by hand under Zero Trust > Access > Service Auth, add it to the
+      MLflow app's Service Auth policy, and paste both halves into ${bundle} —
+      the secret is shown only once.)
   2. make node-authorize NODE=${node}     # grants rsync access over SSH
   3. Send the whole bundle over a private channel — it is a credential.
   4. make test-tunnel NODE=${node}        # verify end to end

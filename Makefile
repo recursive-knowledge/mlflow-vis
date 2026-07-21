@@ -173,6 +173,11 @@ node-provision: ## Build a shareable credential bundle: make node-provision NODE
 	@test -n "$(NODE)" || { echo "usage: make node-provision NODE=<name>"; exit 1; }
 	@bash scripts/node-provision.sh "$(NODE)"
 
+.PHONY: node-token
+node-token: ## Issue a Cloudflare Access service token into a node's bundle
+	@test -n "$(NODE)" || { echo "usage: make node-token NODE=<name>"; exit 1; }
+	@$(UV) run python scripts/node-token.py "$(NODE)"
+
 .PHONY: node-authorize
 node-authorize: ## Grant a provisioned node rsync access over SSH (asks first)
 	@test -n "$(NODE)" || { echo "usage: make node-authorize NODE=<name>"; exit 1; }
