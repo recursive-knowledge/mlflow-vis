@@ -1,4 +1,4 @@
-"""Generate every secret the stack needs, idempotently, into .env.
+"""Generate every secret the stack needs, idempotently, into env/server.env.
 
 Only fills blanks — an existing value is never overwritten, so re-running
 after adding a variable is safe and never invalidates a live database
@@ -42,7 +42,10 @@ def read_env(path: Path) -> tuple[list[str], dict[str, str]]:
 
 def main() -> int:
     if not ENV_PATH.exists():
-        print("no .env — run: cp env/server.env.example env/server.env", file=sys.stderr)
+        print(
+            "no env/server.env — run: cp env/server.env.example env/server.env",
+            file=sys.stderr,
+        )
         return 1
 
     lines, values = read_env(ENV_PATH)
