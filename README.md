@@ -7,6 +7,151 @@ and report to this box; MLflow is the one place to watch all of it.
 
 ---
 
+# Setting up a compute node
+
+**Start here if someone sent you a bundle** (e.g. `all.zip`). You do not need
+this repo checked out, and you do not need access to the server.
+
+The zip contains three files:
+
+| File | What it is |
+|---|---|
+| `<name>.env` | Tracking URI, Cloudflare Access token, rsync target |
+| `<name>_id_ed25519` | SSH key for checkpoint transfer |
+| `<name>_id_ed25519.pub` | Its public half |
+
+It is a **credential**. Treat it like a password: no shared filesystems, no
+git, no Slack.
+
+### 1. Unpack, and fix the permissions
+
+```bash
+mkdir -p ~/.rk && unzip all.zip -d ~/.rk
+chmod 600 ~/.rk/all.env ~/.rk/all_id_ed25519
+```
+
+The `chmod` is not optional — `ssh` refuses to use a private key that other
+users can read, and the failure message points at the key rather than at
+permissions.
+
+### 2. Install the client
+
+```bash
+uv pip install 'git+ssh://git@github.com/<org>/mlflow-vis.git#subdirectory=client'
+```
+
+This is what makes authentication automatic: it registers an MLflow
+request-header provider that attaches the Cloudflare Access headers to every
+REST call, so training code never has to know the server is gated. It also
+installs the `rk-ckpt-sync` command.
+
+If you do not have access to the repo, ask for the `client/` directory and
+`uv pip install ./client` instead. Without this package MLflow receives an
+HTML login page and fails with a confusing JSON parse error.
+
+### 3. Load the environment
+
+```bash
+source ~/.rk/all.env
+```
+
+Put that in your shell profile *and* in any batch/job script — a scheduler
+job does not inherit your interactive shell.
+
+### 4. Verify both paths before you train
+
+Telemetry, over the tunnel:
+
+```bash
+python -c "import mlflow; print(mlflow.search_experiments())"
+```
+
+Checkpoints, over SSH — a separate path with separate credentials, so it can
+fail independently:
+
+```bash
+ssh -i "$RK_CKPT_KEY" -p "$RK_CKPT_PORT" "$RK_CKPT_HOST" true && echo "rsync path OK"
+```
+
+A list of experiments and a silent `OK` mean you are done. A login page or a
+302 means the Access token is missing; `Permission denied (publickey)` means
+the server has not authorized your key yet — ask whoever sent the bundle to
+run `make node-authorize`.
+
+### 5. Point verl at it
+
+```yaml
+trainer:
+  project_name: rl-posttraining
+  experiment_name: all           # unique per node
+  logger: ['console', 'mlflow']  # console = local fallback if tracking blips
+  save_freq: 50
+  default_local_dir: /scratch/ckpts/all
+```
+
+## Shipping checkpoints — `rk-ckpt-sync`
+
+Metrics go over the tunnel; **checkpoint bytes never do.** Cloudflare caps
+request bodies at 100 MB. `rk-ckpt-sync` rsyncs the directory over SSH and
+logs only a *pointer* to MLflow.
+
+```bash
+rk-ckpt-sync --local-dir /scratch/ckpts/all/global_step_50 --step 50 --run-id <run-id>
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--local-dir` | *required* | Checkpoint directory on this node |
+| `--step` | *required* | `global_step` this checkpoint corresponds to |
+| `--run-id` | `$MLFLOW_RUN_ID`, else the active run | Which MLflow run to attach the pointer to |
+| `--experiment` | `$MLFLOW_EXPERIMENT_NAME`, else `default` | Groups the remote directory |
+| `--kind` | `sharded` | `sharded` = resumable, tied to topology; `hf` = exported weights |
+| `--dry-run` | off | Print the size and destination, transfer nothing |
+
+Always start with `--dry-run`. It shows exactly where the bytes would land
+without moving any.
+
+**Two defaults that bite from a shell hook.** After training exits there is no
+active MLflow run and `MLFLOW_RUN_ID` is usually unset, so pass `--run-id`
+explicitly — copy it from the run's URL in the UI. Likewise
+`MLFLOW_EXPERIMENT_NAME` is not exported by the verl config, so without
+`--experiment` your checkpoints land under `default/` while the run itself
+lives elsewhere. Set both:
+
+```bash
+export MLFLOW_EXPERIMENT_NAME=all
+rk-ckpt-sync --local-dir /scratch/ckpts/all/global_step_50 --step 50 --run-id abc123…
+```
+
+### What it does
+
+Bytes land at `$RK_CKPT_ROOT/<experiment>/<run_id>/step_<N>` on the server,
+staged as `step_<N>.incoming` and renamed only on success — the server's
+retention sweep skips `*.incoming`, so an interrupted transfer is never
+mistaken for a complete checkpoint nor reaped mid-flight. Re-running the same
+step is safe; it resumes with `--partial` and replaces on completion.
+
+It then tags the MLflow run so the checkpoint is discoverable from the UI:
+
+| Tag / metric | Value |
+|---|---|
+| `ckpt.step_<N>.uri` | `user@host:/path/to/step_<N>` |
+| `ckpt.step_<N>.kind` | `sharded` or `hf` |
+| `ckpt.step_<N>.size_gb` | Transferred size |
+| `ckpt.step_<N>.config_hash` | Fingerprint of `config.json` / `config.yaml` / `params.json` |
+| `ckpt.latest_step` | Most recent step synced |
+| `ckpt_size_gb` (metric) | Size, plotted against step |
+
+The config hash matters for resuming: a sharded checkpoint needs the exact
+config it was written with, and a mismatch is the difference between a
+resumable artifact and a directory of unusable tensors.
+
+> Checkpoints are pruned on the server by retention policy (`CKPT_KEEP_LAST`
+> steps per run). To keep one permanently, ask for a `.keep` file to be placed
+> in its directory — the sweep never touches those.
+
+---
+
 ## The one thing to understand
 
 Two kinds of traffic, two completely different paths:
@@ -88,37 +233,16 @@ make node-authorize NODE=julius   # grants rsync access (asks for confirmation)
 make test-tunnel    NODE=julius   # verifies telemetry end to end
 ```
 
-Then hand them `env/nodes/julius.env` and its keyfile over a private channel.
+Zip `env/nodes/julius.env` together with its keyfile and send it over a
+private channel. What the recipient does with it is
+[Setting up a compute node](#setting-up-a-compute-node) at the top of this
+file — point them there rather than explaining it again.
+
+`make node-authorize` is the step that is easy to forget: without it telemetry
+works and rsync fails with `Permission denied (publickey)`.
 
 Teammates who only want to *look* at the dashboard need none of this — send
 them the URL. Access lets any address matching your policy sign in by email.
-
-On the node:
-
-```bash
-source julius.env
-uv pip install 'git+ssh://git@github.com/<org>/mlflow-vis.git#subdirectory=client'
-```
-
-That installs an MLflow auth plugin (attaches the Access headers to every REST
-call automatically) and the `rk-ckpt-sync` command.
-
-### verl config
-
-```yaml
-trainer:
-  project_name: rl-posttraining
-  experiment_name: julius        # unique per node
-  logger: ['console', 'mlflow']  # console = local fallback if tracking blips
-  save_freq: 50
-  default_local_dir: /scratch/ckpts/julius
-```
-
-After each save, ship the checkpoint and link it to the run:
-
-```bash
-rk-ckpt-sync --local-dir /scratch/ckpts/julius/global_step_50 --step 50
-```
 
 ---
 
