@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rk-mlflow-client"
+version = "0.1.0"
+description = "Node-side helpers for reporting verl runs to the rk-mlflow coordination server"
+requires-python = ">=3.9"
+dependencies = ["mlflow-skinny>=2.9"]
+
+[project.scripts]
+rk-ckpt-sync = "rk_mlflow_client.ckpt_sync:main"
+
+# Registering here is what makes the Cloudflare Access headers automatic:
+# MLflow discovers the provider and applies it to every outbound request,
+# so training code never has to know the tracking server is gated.
+[project.entry-points."mlflow.request_header_provider"]
+cloudflare_access = "rk_mlflow_client.auth:CloudflareAccessHeaderProvider"
+
+[tool.setuptools.packages.find]
+where = ["src"]
