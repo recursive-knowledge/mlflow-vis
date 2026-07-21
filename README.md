@@ -37,7 +37,7 @@ permissions.
 ### 2. Install the client
 
 ```bash
-uv pip install 'git+ssh://git@github.com/<org>/mlflow-vis.git#subdirectory=client'
+uv pip install 'git+ssh://git@github.com/recursive-knowledge/mlflow-vis.git#subdirectory=client'
 ```
 
 This is what makes authentication automatic: it registers an MLflow
@@ -45,9 +45,26 @@ request-header provider that attaches the Cloudflare Access headers to every
 REST call, so training code never has to know the server is gated. It also
 installs the `rk-ckpt-sync` command.
 
+**Install it into the same interpreter that runs your training.** If you use a
+venv, activate it first — `uv pip install` targeting one environment while
+`python` resolves to another is the single most common way this goes wrong.
+
+Confirm it registered before going further:
+
+```bash
+python -c "from mlflow.tracking.request_header.registry import \
+_request_header_provider_registry as r; \
+print([type(p).__name__ for p in r])"
+```
+
+`CloudflareAccessHeaderProvider` must appear in that list. If it does not, the
+package is not installed in *this* interpreter, and every MLflow call will
+come back as an HTML login page — MLflow reports that as
+`response body was not in a valid JSON format`, naming Cloudflare rather than
+the missing package.
+
 If you do not have access to the repo, ask for the `client/` directory and
-`uv pip install ./client` instead. Without this package MLflow receives an
-HTML login page and fails with a confusing JSON parse error.
+`uv pip install ./client` instead.
 
 ### 3. Load the environment
 
@@ -73,10 +90,17 @@ fail independently:
 ssh -i "$RK_CKPT_KEY" -p "$RK_CKPT_PORT" "$RK_CKPT_HOST" true && echo "rsync path OK"
 ```
 
-A list of experiments and a silent `OK` mean you are done. A login page or a
-302 means the Access token is missing; `Permission denied (publickey)` means
-the server has not authorized your key yet — ask whoever sent the bundle to
-run `make node-authorize`.
+A list of experiments and a silent `OK` mean you are done. Otherwise:
+
+| What you see | What it means |
+|---|---|
+| `response body was not in a valid JSON format` with `Sign in · Cloudflare Access` HTML | The client package is not registered in this interpreter — go back to step 2. This is *not* a token problem; MLflow sent the request without the Access headers |
+| `403` | The token is wrong, or it was never added to the application's Service Auth policy |
+| `Permission denied (publickey)` | The server has not authorized your key — ask whoever sent the bundle to run `make node-authorize` |
+| `Host key verification failed` | Accept the host key once: `ssh -i "$RK_CKPT_KEY" -p "$RK_CKPT_PORT" "$RK_CKPT_HOST"` |
+
+The two paths use different credentials and fail independently — telemetry
+working tells you nothing about whether rsync will.
 
 ### 5. Point verl at it
 

@@ -146,7 +146,7 @@ On each node:
 
 ```bash
 source julius.env
-uv pip install 'git+ssh://git@github.com/<org>/mlflow-vis.git#subdirectory=client'
+uv pip install 'git+ssh://git@github.com/recursive-knowledge/mlflow-vis.git#subdirectory=client'
 ```
 
 The `rk-mlflow-client` package registers an MLflow request-header provider
