@@ -71,7 +71,7 @@ def main() -> int:
     root = os.environ.get("RK_CKPT_ROOT")
     port = os.environ.get("RK_CKPT_PORT", "22")
     if not host or not root:
-        sys.exit("set RK_CKPT_HOST and RK_CKPT_ROOT (see: make node-env)")
+        sys.exit("set RK_CKPT_HOST and RK_CKPT_ROOT — source your node bundle first")
 
     run_id = args.run_id
     if not run_id:
@@ -95,15 +95,24 @@ def main() -> int:
         print("(dry run — nothing transferred, nothing logged)")
         return 0
 
-    ssh = f"ssh -p {port} -o StrictHostKeyChecking=accept-new"
-    run(["ssh", "-p", port, user_host, f"mkdir -p {shlex.quote(remote_run_dir)}"])
+    # The bundle ships a dedicated key rather than relying on the node's
+    # default identity, so it has to be passed explicitly — every ssh here and
+    # the one rsync tunnels over. IdentitiesOnly stops ssh offering every
+    # agent key first and tripping the server's MaxAuthTries.
+    ssh_opts = ["-p", port, "-o", "StrictHostKeyChecking=accept-new"]
+    key = os.environ.get("RK_CKPT_KEY")
+    if key:
+        ssh_opts += ["-i", os.path.expanduser(key), "-o", "IdentitiesOnly=yes"]
+    ssh_cmd = ["ssh", *ssh_opts]
+
+    run([*ssh_cmd, user_host, f"mkdir -p {shlex.quote(remote_run_dir)}"])
     run([
         "rsync", "-a", "--partial", "--inplace", "--compress-level=0",
-        "--info=progress2", "-e", ssh,
+        "--info=progress2", "-e", shlex.join(ssh_cmd),
         f"{local_dir}/", f"{user_host}:{staging}/",
     ])
     # Atomic-enough promotion; rsync has already fsynced the contents.
-    run(["ssh", "-p", port, user_host,
+    run([*ssh_cmd, user_host,
          f"rm -rf {shlex.quote(final)} && mv {shlex.quote(staging)} {shlex.quote(final)}"])
 
     client = mlflow.MlflowClient()
