@@ -1,0 +1,8 @@
+# Upstream supabase/supabase commit that this stack's image tags and init SQL
+# are taken from. `make install` fetches the vendored assets at exactly this
+# ref, so a fresh clone reproduces the same stack.
+#
+# To upgrade: bump this SHA, run `make install`, diff supabase/upstream/,
+# and bump the image tags in compose.yaml to match that commit's
+# docker/docker-compose.yml.
+9cf6ae1f6779efcef70dcc94d64e5d8e1cee8304

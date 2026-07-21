@@ -1,0 +1,298 @@
+name: rk-mlflow
+
+# Coordination stack for RL training telemetry.
+#
+#   db          Supabase Postgres — metadata + pointers only
+#   rest        PostgREST — storage-api dependency, and Studio's data API
+#   storage     Supabase Storage — S3-compatible bucket for MLflow artifacts
+#   mlflow      tracking server + model registry  [the visualization surface]
+#   meta/kong/studio   admin console          (profile: studio, loopback only)
+#   cloudflared        public tunnel          (profile: tunnel)
+#
+# Two things deliberately absent:
+#   - Checkpoints. They never enter this stack; nodes rsync them over SSH to
+#     ${RK_DATA_ROOT}/checkpoints and log only a pointer to MLflow.
+#   - Kong on the MLflow path. MLflow reaches storage-api directly, so the
+#     admin gateway being down cannot stop a training run from logging.
+#
+# Image tags track supabase/supabase at the commit in supabase/PINNED_REF.
+
+x-supabase-db-env: &supabase-db-env
+  POSTGRES_HOST: db
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: ${POSTGRES_DB:-postgres}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+
+services:
+  # ---------------------------------------------------------------- data --
+  db:
+    container_name: rk-db
+    image: supabase/postgres:17.6.1.136
+    restart: unless-stopped
+    environment:
+      POSTGRES_HOST: /var/run/postgresql
+      PGPORT: "5432"
+      POSTGRES_PORT: "5432"
+      PGPASSWORD: ${POSTGRES_PASSWORD:-}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      PGDATABASE: ${POSTGRES_DB:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+      JWT_SECRET: ${JWT_SECRET:-}
+      JWT_EXP: ${JWT_EXPIRY:-3600}
+      MLFLOW_DB_PASSWORD: ${MLFLOW_DB_PASSWORD:-}
+    volumes:
+      # Vendored from upstream by `make install` — these create the roles
+      # (supabase_storage_admin, anon, service_role, …) storage-api needs.
+      - ./supabase/upstream/db/webhooks.sql:/docker-entrypoint-initdb.d/init-scripts/98-webhooks.sql:ro
+      - ./supabase/upstream/db/roles.sql:/docker-entrypoint-initdb.d/init-scripts/99-roles.sql:ro
+      - ./supabase/upstream/db/jwt.sql:/docker-entrypoint-initdb.d/init-scripts/99-jwt.sql:ro
+      - ./supabase/upstream/db/_supabase.sql:/docker-entrypoint-initdb.d/migrations/97-_supabase.sql:ro
+      - ./supabase/upstream/db/realtime.sql:/docker-entrypoint-initdb.d/migrations/99-realtime.sql:ro
+      - ./supabase/upstream/db/logs.sql:/docker-entrypoint-initdb.d/migrations/99-logs.sql:ro
+      - ./supabase/upstream/db/pooler.sql:/docker-entrypoint-initdb.d/migrations/99-pooler.sql:ro
+      # Ours: carves out a separate database + least-privilege role for MLflow.
+      - ./supabase/init/99-mlflow.sql:/docker-entrypoint-initdb.d/migrations/99-mlflow.sql:ro
+      - ${RK_DATA_ROOT:-/overflow/recursive-knowledge}/supabase/db:/var/lib/postgresql/data
+      - db-config:/etc/postgresql-custom
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/postgresql.conf
+      - -c
+      - log_min_messages=fatal
+    networks: [rk]
+    # Never published. Use `make psql`.
+
+  rest:
+    container_name: rk-rest
+    image: postgrest/postgrest:v14.12
+    restart: unless-stopped
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      PGRST_DB_URI: postgres://authenticator:${POSTGRES_PASSWORD:-}@db:5432/${POSTGRES_DB:-postgres}
+      PGRST_DB_SCHEMAS: ${PGRST_DB_SCHEMAS:-public,storage}
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${JWT_SECRET:-}
+      PGRST_DB_USE_LEGACY_GUCS: "false"
+      PGRST_APP_SETTINGS_JWT_SECRET: ${JWT_SECRET:-}
+      PGRST_APP_SETTINGS_JWT_EXP: ${JWT_EXPIRY:-3600}
+    command: postgrest
+    networks: [rk]
+
+  storage:
+    container_name: rk-storage
+    image: supabase/storage-api:v1.60.4
+    restart: unless-stopped
+    depends_on:
+      db: { condition: service_healthy }
+      rest: { condition: service_started }
+    environment:
+      ANON_KEY: ${ANON_KEY:-}
+      SERVICE_KEY: ${SERVICE_ROLE_KEY:-}
+      AUTH_JWT_SECRET: ${JWT_SECRET:-}
+      POSTGREST_URL: http://rest:3000
+      DATABASE_URL: postgres://supabase_storage_admin:${POSTGRES_PASSWORD:-}@db:5432/${POSTGRES_DB:-postgres}
+      # Must match the host clients sign their S3 requests against, NOT the
+      # browser-facing Studio URL: storage-api reconstructs the canonical
+      # request from this value, so a mismatch fails every request with
+      # SignatureDoesNotMatch. MLflow reaches it as http://storage:5000.
+      STORAGE_PUBLIC_URL: ${STORAGE_INTERNAL_URL:-http://storage:5000}
+      # Off: that header only exists when Kong fronts storage, and enabling it
+      # makes storage-api verify signatures against a path the client never signed.
+      REQUEST_ALLOW_X_FORWARDED_PATH: "false"
+      # MLflow artifacts here are small (configs, plots, eval tables) —
+      # model weights go by rsync — but the default 50 MB is tight for a
+      # merged HF export, so this is raised deliberately.
+      FILE_SIZE_LIMIT: ${STORAGE_FILE_SIZE_LIMIT:-5368709120}
+      STORAGE_BACKEND: file
+      FILE_STORAGE_BACKEND_PATH: /var/lib/storage
+      GLOBAL_S3_BUCKET: ${GLOBAL_S3_BUCKET:-stub}
+      TENANT_ID: ${STORAGE_TENANT_ID:-rk}
+      REGION: ${REGION:-local}
+      # No imgproxy in this stack — nothing here is an image to transform.
+      ENABLE_IMAGE_TRANSFORMATION: "false"
+      S3_PROTOCOL_ACCESS_KEY_ID: ${S3_PROTOCOL_ACCESS_KEY_ID:-}
+      S3_PROTOCOL_ACCESS_KEY_SECRET: ${S3_PROTOCOL_ACCESS_KEY_SECRET:-}
+    volumes:
+      - ${RK_DATA_ROOT:-/overflow/recursive-knowledge}/supabase/storage:/var/lib/storage
+    healthcheck:
+      # 127.0.0.1, not localhost: storage-api binds IPv4 only, and busybox
+      # wget resolves localhost to ::1 first and gets connection refused.
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:5000/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks: [rk]
+
+  # ------------------------------------------------------------- tracking --
+  mlflow:
+    container_name: rk-mlflow
+    build:
+      # Root context: the image is defined by the committed uv.lock.
+      context: .
+      dockerfile: docker/mlflow/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db: { condition: service_healthy }
+      storage: { condition: service_healthy }
+    environment:
+      # storage-api serves the S3 protocol at /s3 (no /storage/v1 prefix —
+      # that prefix only exists when routed through Kong).
+      MLFLOW_S3_ENDPOINT_URL: http://storage:5000/s3
+      AWS_ACCESS_KEY_ID: ${S3_PROTOCOL_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${S3_PROTOCOL_ACCESS_KEY_SECRET:-}
+      AWS_DEFAULT_REGION: ${REGION:-local}
+      AWS_S3_ADDRESSING_STYLE: path
+      MLFLOW_S3_IGNORE_TLS: "true"
+    command:
+      - mlflow
+      - server
+      - --backend-store-uri
+      - postgresql+psycopg2://mlflow:${MLFLOW_DB_PASSWORD:-}@db:5432/mlflow
+      - --serve-artifacts
+      - --artifacts-destination
+      - s3://${MLFLOW_BUCKET:-mlflow}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5000"
+      # Without these, MLflow 3's DNS-rebinding guard 403s every request
+      # arriving with the tunnel's Host header — the UI and every node API
+      # call fail while /health still returns 200, so it looks healthy.
+      - --allowed-hosts
+      - ${MLFLOW_ALLOWED_HOSTS:-localhost,localhost:5000,127.0.0.1,127.0.0.1:5000}
+      - --cors-allowed-origins
+      - ${MLFLOW_CORS_ORIGINS:-http://localhost:5000,http://127.0.0.1:5000}
+      - --workers
+      - ${MLFLOW_WORKERS:-4}
+      # Left on the default uvicorn server on purpose: --gunicorn-opts is
+      # mutually exclusive with the security flags above, and uvicorn is what
+      # MLflow 3 recommends anyway.
+      - --uvicorn-opts
+      - --timeout-keep-alive 120
+    ports:
+      # Loopback by default; the tunnel is the public path.
+      - "${MLFLOW_BIND_ADDR:-127.0.0.1}:${MLFLOW_PORT:-5000}:5000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:5000/health').read()"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    networks: [rk]
+
+  # ---------------------------------------------------------------- admin --
+  # Studio is an admin console, not a visualization surface — MLflow is.
+  # Never routed through the tunnel; reach it with `make studio`.
+  meta:
+    container_name: rk-meta
+    image: supabase/postgres-meta:v0.96.6
+    restart: unless-stopped
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      PG_META_PORT: "8080"
+      PG_META_DB_HOST: db
+      PG_META_DB_PORT: "5432"
+      PG_META_DB_NAME: ${POSTGRES_DB:-postgres}
+      PG_META_DB_USER: postgres
+      PG_META_DB_PASSWORD: ${POSTGRES_PASSWORD:-}
+      CRYPTO_KEY: ${PG_META_CRYPTO_KEY:-}
+    networks: [rk]
+    profiles: [studio]
+
+  studio:
+    container_name: rk-studio
+    image: supabase/studio:2026.07.07-sha-a6a04f2
+    restart: unless-stopped
+    depends_on:
+      db: { condition: service_healthy }
+    environment:
+      HOSTNAME: "0.0.0.0"
+      STUDIO_PG_META_URL: http://meta:8080
+      <<: *supabase-db-env
+      POSTGRES_USER_READ_WRITE: postgres
+      PG_META_CRYPTO_KEY: ${PG_META_CRYPTO_KEY:-}
+      PGRST_DB_SCHEMAS: ${PGRST_DB_SCHEMAS:-public,storage}
+      DEFAULT_ORGANIZATION_NAME: ${STUDIO_DEFAULT_ORGANIZATION:-recursive-knowledge}
+      DEFAULT_PROJECT_NAME: ${STUDIO_DEFAULT_PROJECT:-rk-mlflow}
+      SUPABASE_URL: http://kong:8000
+      SUPABASE_PUBLIC_URL: ${SUPABASE_PUBLIC_URL:-http://localhost:8000}
+      SUPABASE_ANON_KEY: ${ANON_KEY:-}
+      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY:-}
+      AUTH_JWT_SECRET: ${JWT_SECRET:-}
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://localhost:3000/api/platform/profile').then((r) => {if (r.status !== 200) throw new Error(r.status)})\""]
+      timeout: 10s
+      interval: 10s
+      retries: 5
+      start_period: 30s
+    networks: [rk]
+    profiles: [studio]
+
+  kong:
+    container_name: rk-kong
+    image: kong/kong:3.9.1
+    restart: unless-stopped
+    depends_on:
+      studio: { condition: service_healthy }
+    environment:
+      KONG_DATABASE: "off"
+      KONG_DECLARATIVE_CONFIG: /usr/local/kong/kong.yml
+      KONG_ROUTER_FLAVOR: expressions
+      KONG_DNS_ORDER: LAST,A,CNAME
+      KONG_DNS_NOT_FOUND_TTL: "1"
+      KONG_PLUGINS: request-transformer,cors,key-auth,acl,basic-auth,request-termination,ip-restriction,post-function
+      KONG_NGINX_PROXY_PROXY_BUFFER_SIZE: 160k
+      KONG_NGINX_PROXY_PROXY_BUFFERS: 64 160k
+      SUPABASE_ANON_KEY: ${ANON_KEY:-}
+      SUPABASE_SERVICE_KEY: ${SERVICE_ROLE_KEY:-}
+      DASHBOARD_USERNAME: ${DASHBOARD_USERNAME:-admin}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:-}
+    volumes:
+      - ./supabase/upstream/api/kong.yml:/home/kong/temp.yml:ro
+      - ./supabase/upstream/api/kong-entrypoint.sh:/home/kong/kong-entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/home/kong/kong-entrypoint.sh"]
+    ports:
+      - "${STUDIO_BIND_ADDR:-127.0.0.1}:${STUDIO_PORT:-8000}:8000"
+    networks: [rk]
+    profiles: [studio]
+
+  # --------------------------------------------------------------- public --
+  cloudflared:
+    container_name: rk-tunnel
+    image: cloudflare/cloudflared:2026.6.1
+    restart: unless-stopped
+    depends_on:
+      mlflow: { condition: service_healthy }
+    # Token-based tunnel: ingress lives in the Cloudflare dashboard and must
+    # point at http://mlflow:5000 — and nothing else.
+    command: tunnel --no-autoupdate --metrics 0.0.0.0:2000 run
+    environment:
+      # Validated by `make up-tunnel`, not here: compose interpolates every
+      # service on every command, so a required-variable marker on a
+      # profile-gated service would break plain `make up` too.
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    healthcheck:
+      test: ["CMD", "cloudflared", "tunnel", "--metrics", "localhost:2000", "ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+    networks: [rk]
+    profiles: [tunnel]
+
+volumes:
+  db-config:
+
+networks:
+  rk:
+    driver: bridge
