@@ -1,0 +1,24 @@
+# Secrets — never commit. Only the .example templates are tracked.
+env/server.env
+env/nodes/*
+!env/nodes/.gitkeep
+.env
+secrets/
+*.pem
+*.key
+id_rk_*
+
+# Vendored upstream, refetched by `make install` from supabase/PINNED_REF
+supabase/upstream/
+
+# Editor artifacts
+*.swp
+*.swo
+*~
+
+# Local state
+.venv/
+__pycache__/
+*.egg-info/
+dist/
+build/

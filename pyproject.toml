@@ -1,0 +1,36 @@
+[project]
+name = "rk-mlflow-server"
+version = "0.1.0"
+description = "Server-side Python environment for the rk-mlflow coordination stack"
+# Spans both interpreters this repo uses:
+#   3.13  the tracking-server image (docker/mlflow/Dockerfile)
+#   3.14  the local ops venv (.python-version)
+#
+# The server is pinned to 3.13 deliberately. MLflow 3.14.0's uvicorn entry
+# point imports importlib.abc.Traversable, which Python 3.14 removed, so the
+# server cannot boot on 3.14 — and it must run under uvicorn, because the
+# --allowed-hosts flag that lets the tunnel work is rejected under gunicorn.
+requires-python = ">=3.13"
+
+# These pins define the tracking server image. uv.lock is committed, so
+# `make install` reproduces byte-identical dependencies for anyone cloning.
+dependencies = [
+    "mlflow==3.14.0",
+    "psycopg2-binary>=2.9.9",
+    # boto3 is not optional: artifacts live in Supabase Storage over its
+    # S3-compatible endpoint, so MLflow always takes the S3 code path.
+    "boto3>=1.35",
+]
+
+[dependency-groups]
+# Used by scripts/ on the host (secret generation, bucket bootstrap, smoke
+# test). Not installed into the server image.
+ops = [
+    "boto3>=1.35",
+    "pyjwt>=2.9",
+    "requests>=2.32",
+    "mlflow-skinny==3.14.0",
+]
+
+[tool.uv]
+package = false
