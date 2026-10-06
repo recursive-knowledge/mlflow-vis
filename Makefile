@@ -15,7 +15,7 @@ REPO := $(shell pwd)
 UV   := $(shell command -v uv 2>/dev/null || echo $$HOME/.local/bin/uv)
 
 COMPOSE   := docker compose --env-file $(SERVER_ENV)
-DC_ALL    := docker compose --env-file $(SERVER_ENV) --profile studio --profile tunnel
+DC_ALL    := docker compose --env-file $(SERVER_ENV) --profile studio --profile tunnel --profile auth
 # One-off container on the compose network, for scripts that must reach
 # storage-api or the database by service name.
 DC_RUN    := docker compose --env-file $(SERVER_ENV) run --rm --no-deps \
@@ -84,6 +84,16 @@ up-tunnel: check-env dirs ## Start core + the public Cloudflare tunnel
 	  echo "CLOUDFLARE_TUNNEL_TOKEN is empty — see cloudflare/README.md"; exit 1; }
 	$(COMPOSE) --profile tunnel up -d --build --wait
 	@$(MAKE) --no-print-directory health
+
+# --no-deps, and only this service: recreating rk-mlflow restarts the server the
+# verl nodes log to, and nothing about this service requires that.
+.PHONY: up-auth
+up-auth: check-env ## Start the basic-auth tracking server (rk-mlflow-auth) only
+	@for v in MLFLOW_API_HOSTNAME MLFLOW_FLASK_SERVER_SECRET_KEY MLFLOW_AUTH_ADMIN_PASSWORD; do \
+	  test -n "$${!v}" || { echo "$$v is empty — see cloudflare/README.md section 6"; exit 1; }; \
+	done
+	$(COMPOSE) --profile auth up -d --build --no-deps --wait mlflow-auth
+	@echo "rk-mlflow-auth up on 127.0.0.1:$(or $(MLFLOW_AUTH_PORT),5001) — next: make auth-hostname"
 
 .PHONY: studio
 studio: check-env ## Start the Supabase admin console (loopback only)
@@ -187,6 +197,7 @@ node-authorize: ## Grant a provisioned node rsync access over SSH (asks first)
 node-list: ## List provisioned node bundles
 	@ls -1 env/nodes/*.env 2>/dev/null | sed 's|env/nodes/|  |;s|\.env$$||' || echo "  (none — make node-provision NODE=<name>)"
 
+
 # ---------------------------------------------------------------------------
 ##@ Tests
 
@@ -198,6 +209,11 @@ smoke: ## Log a run over loopback — proves db + storage are wired up
 test-tunnel: ## Log a run through the Cloudflare tunnel as a node would
 	@test -n "$(NODE)" || { echo "usage: make test-tunnel NODE=<name>"; exit 1; }
 	@$(UV) run python scripts/test-tunnel.py "$(NODE)"
+
+# Dry run unless APPLY=1, like `make prune`.
+.PHONY: auth-hostname
+auth-hostname: ## Configure the mlflow-api edge: tunnel route, DNS, rate limit (APPLY=1 to make changes)
+	@APPLY="$(APPLY)" $(UV) run python scripts/auth-hostname.py
 
 .PHONY: test
 test: smoke ## Run every check that does not need the tunnel

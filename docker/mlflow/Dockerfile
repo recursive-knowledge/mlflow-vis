@@ -27,4 +27,10 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project --python 3.13
 
+# Last, so the dependency layer above stays cached. Both are inert for the
+# plain `mlflow` service — only `mlflow-auth` sets this entrypoint, and only it
+# reads the template. See compose.yaml.
+COPY docker/mlflow/basic_auth.ini.template /etc/mlflow/basic_auth.ini.template
+COPY docker/mlflow/auth-entrypoint.sh /usr/local/bin/auth-entrypoint.sh
+
 EXPOSE 5000
