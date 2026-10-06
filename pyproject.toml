@@ -15,7 +15,13 @@ requires-python = ">=3.13"
 # These pins define the tracking server image. uv.lock is committed, so
 # `make install` reproduces byte-identical dependencies for anyone cloning.
 dependencies = [
-    "mlflow==3.14.0",
+    # [auth] is what the mlflow-auth service needs: `--app-name basic-auth`
+    # imports mlflow.server.auth, which raises ImportError without Flask-WTF
+    # (it drives the CSRF protection on the one browser-reachable route).
+    # The extra adds only flask-wtf + wtforms, and the plain `mlflow` server
+    # behaves identically with them installed — so both services build from
+    # this one lock.
+    "mlflow[auth]==3.14.0",
     "psycopg2-binary>=2.9.9",
     # boto3 is not optional: artifacts live in Supabase Storage over its
     # S3-compatible endpoint, so MLflow always takes the S3 code path.
