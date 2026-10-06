@@ -5,12 +5,13 @@ JSON only** — never checkpoint bytes. Cloudflare proxies cap request bodies at
 100 MB and checkpoints are gigabytes, so bulk transfer goes over SSH/rsync on
 the private network instead. Keep it that way.
 
-Two different things authenticate through it:
+Three different things authenticate through it:
 
 | Who | How | What they get |
 |---|---|---|
 | Teammates | SSO in a browser | The MLflow UI |
 | verl nodes | Access **service token** | The MLflow REST API |
+| Clients that cannot do Access | MLflow **basic auth**, on a second hostname | One or more named experiments (§6) |
 
 Everything below is configured in `env/server.env` — there is no `.env` in
 this repo. That file is gitignored and `chmod 600`; the Makefile passes it to
@@ -168,6 +169,138 @@ metrics and an artifact exactly as verl would.
 
 ---
 
+## 6. A second hostname for clients that cannot do Access
+
+Some clients can only send `Authorization: Bearer …` or HTTP Basic. The
+`@mlflow/codex` Node plugin is the one that forced this: its `@mlflow/core`
+client has no way to attach `CF-Access-Client-Id` / `-Secret`, so it cannot pass
+the Access application no matter how the token is issued. Cloudflare's
+single-header service-token mode does not rescue it either — that wants the raw
+JSON `{"cf-access-client-id": …, "cf-access-client-secret": …}` in
+`Authorization`, and the client always sends `Bearer <token>`.
+
+The answer is **not** a Bypass policy on `mlflow.<domain>`: §4 explains why —
+`/api/*` is full read *and* write, including `DELETE`. Instead there is a second
+tracking server with a real user model, on its own hostname:
+
+| | `mlflow.<domain>` | `mlflow-api.<domain>` |
+|---|---|---|
+| Gate | Cloudflare Access | MLflow basic auth (`--app-name basic-auth`) |
+| Container | `rk-mlflow` | `rk-mlflow-auth` (compose profile `auth`) |
+| Store + bucket | **the same** | **the same** |
+| Users | teammates, verl nodes | one MLflow user per client |
+
+Tracking servers are stateless over the shared SQL backend, so both processes
+serve the same runs; `--app-name basic-auth` applies only to the second. Users
+and permissions live in their own `mlflow_auth` database, which holds no
+tracking data.
+
+```bash
+make up-auth                  # start rk-mlflow-auth (loopback 5001)
+make auth-hostname            # show the edge plan: route, DNS, rate limit
+make auth-hostname APPLY=1    # make those changes
+```
+
+### Creating a user
+
+There is deliberately no script for this — one user is expected, and the admin
+API is three calls. As admin (password in `MLFLOW_AUTH_ADMIN_PASSWORD`), against
+loopback so the tunnel need not be up:
+
+```bash
+A=admin:$MLFLOW_AUTH_ADMIN_PASSWORD
+H=http://127.0.0.1:5001
+
+# 1. the user (password >= 12 chars; generate, do not invent)
+PW=$(python3 -c 'import secrets,string;print("".join(secrets.choice(string.ascii_letters+string.digits) for _ in range(32)))')
+curl -s -u $A -X POST -H 'Content-Type: application/json' \
+  -d "{\"username\":\"datasmith\",\"password\":\"$PW\"}" \
+  $H/api/2.0/mlflow/users/create
+
+# 2. one experiment, explicitly — default_permission is NO_PERMISSIONS
+curl -s -u $A -X POST -H 'Content-Type: application/json' \
+  -d '{"username":"datasmith","resource_type":"experiment","resource_id":"23","permission":"EDIT"}' \
+  $H/api/3.0/mlflow/users/permissions/grant
+
+# 3. what it actually has (explicit rows, not the resolved default)
+curl -s -u $A "$H/api/3.0/mlflow/users/permissions/list?username=datasmith"
+```
+
+Two traps worth knowing. `permissions/grant` is **not** an upsert — it returns
+`RESOURCE_ALREADY_EXISTS`, and there is no update route, so changing a grant is
+`permissions/revoke` then `grant`. And `permissions/get` reports the *effective*
+permission, answering `200 {"permission":"NO_PERMISSIONS"}` for a user with no
+row at all; only `permissions/list` shows real grants. To rotate a password,
+`PATCH /api/2.0/mlflow/users/update-password` with `{username, password}`.
+
+Keep the credentials in `env/nodes/<user>-basic.env` (gitignored, `chmod 600`),
+holding the three variables both the Python and the Node client read natively:
+
+```
+MLFLOW_TRACKING_URI=https://mlflow-api.<domain>
+MLFLOW_TRACKING_USERNAME=<user>
+MLFLOW_TRACKING_PASSWORD=<generated>
+```
+
+No `rk-mlflow-client` and no request-header provider — that package exists only
+to attach the `CF-Access-*` headers, which this hostname neither needs nor
+accepts. Do not put `CF_ACCESS_*` in this bundle.
+
+### What keeps it safe without Access in front
+
+`default_permission = NO_PERMISSIONS`, not MLflow's own `READ` default. A new
+user can reach nothing until it is granted a specific experiment, so a leaked
+credential exposes one experiment rather than the whole store. Only `/health`,
+`/static` and `/favicon.ico` answer without credentials; `/signup` and
+user-creation require an authenticated workspace admin, so there is no
+self-registration.
+
+`make auth-hostname` also refuses to run if any Access application matches the
+hostname — including a wildcard — because a login page in front of a Basic-only
+client fails in a way that is tedious to diagnose. And since Access is no longer
+absorbing credential-guessing traffic, it adds a rate-limiting rule.
+
+> Rate limiting outside Enterprise is narrower than it looks. The period must be
+> **10 seconds** (`not entitled to use the period 60`), `mitigation_timeout` must
+> **equal** the period, and `counting_expression` — which would let the rule
+> count only 401s and so never touch a legitimate client — needs a paid Advanced
+> Rate Limiting plan. The script tries the 401-counting rule first and falls back
+> to 100 requests per 10 s per IP. Override with `RATELIMIT_REQUESTS`.
+
+### Verifying
+
+```bash
+# grep, not a bare sed: the file has comment lines, and `export # …` turns into
+# a bare `export` that dumps the whole environment.
+eval "$(grep '^MLFLOW_' env/nodes/datasmith-basic.env | sed 's/^/export /')"
+H=$MLFLOW_TRACKING_URI
+U=$MLFLOW_TRACKING_USERNAME:$MLFLOW_TRACKING_PASSWORD
+E=$H/api/2.0/mlflow/experiments/get
+
+curl -so /dev/null -w '%{http_code} want 200\n' $H/health              # open by design
+curl -so /dev/null -w '%{http_code} want 401\n' "$E?experiment_id=23"  # no credentials
+curl -so /dev/null -w '%{http_code} want 200\n' -u $U "$E?experiment_id=23"
+curl -so /dev/null -w '%{http_code} want 403\n' -u $U "$E?experiment_id=0"   # not granted
+curl -so /dev/null -w '%{http_code} want 200\n' -u $U -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"locations":[{"type":"MLFLOW_EXPERIMENT","mlflow_experiment":{"experiment_id":"23"}}],"max_results":1}' \
+  $H/api/3.0/mlflow/traces/search                       # the v3 trace API under auth
+```
+
+A **401** for the anonymous call is the one that matters: 200 means the backend
+store is open to the internet, and 403 means the Host guard rejected the request
+before auth ran (hostname missing from `MLFLOW_AUTH_ALLOWED_HOSTS`).
+
+### Rotating and removing
+
+Editing `MLFLOW_AUTH_ADMIN_PASSWORD` afterwards does **not** rotate the admin
+account — `create_admin_user()` runs only when the user is absent; use the
+`users/update-password` API. To remove the hostname entirely: stop and remove
+`rk-mlflow-auth`, delete the `mlflow-api` ingress rule, its DNS record and the
+rate-limiting rule. The `mlflow_auth` database can stay.
+
+---
+
 ## When it does not work
 
 | Symptom | Cause |
@@ -178,6 +311,11 @@ metrics and an artifact exactly as verl would.
 | **1033** in the browser | DNS record exists but the tunnel has no ingress rule, or `cloudflared` is not running |
 | Node gets HTML / a JSON parse error | Service token missing, not in a Service Auth policy, or `rk-mlflow-client` not installed |
 | `make health` says `HTTP 000` right after setup | Your resolver cached the NXDOMAIN from before the record existed. Cloudflare's SOA sets a 30-minute negative TTL; `dig @1.1.1.1` confirms the record is live |
+| `403 Invalid Host header` on `127.0.0.1:5001` | `MLFLOW_AUTH_ALLOWED_HOSTS` must list the **published** port (5001), not the container's internal 5000. Matching is an exact string compare, with no port stripping |
+| Basic-auth API returns **403**, not 401 | The Host guard rejected the request before auth ran — the hostname is missing from `MLFLOW_AUTH_ALLOWED_HOSTS` |
+| Basic-auth API returns **200** with no credentials | `--app-name basic-auth` is not actually on the container. `make logs S=mlflow-auth` |
+| A granted experiment still returns **403** | `default_permission` is `NO_PERMISSIONS`; grant it explicitly via `permissions/grant` (§6) |
+| `rk-mlflow-auth` restart-loops on `Invalid placeholder in string` | `docker/mlflow/basic_auth.ini.template` contains a literal `$`. `string.Template` reads every one as a placeholder |
 
 If the hostname works in one browser but not another, it is client-side —
 check secure DNS (DoH), IPv6 reachability, and extensions. Cloudflare serves
