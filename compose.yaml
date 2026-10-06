@@ -6,6 +6,7 @@ name: rk-mlflow
 #   rest        PostgREST — storage-api dependency, and Studio's data API
 #   storage     Supabase Storage — S3-compatible bucket for MLflow artifacts
 #   mlflow      tracking server + model registry  [the visualization surface]
+#   mlflow-auth same stores, MLflow basic auth    (profile: auth, loopback only)
 #   meta/kong/studio   admin console          (profile: studio, loopback only)
 #   cloudflared        public tunnel          (profile: tunnel)
 #
@@ -188,6 +189,101 @@ services:
       retries: 10
       start_period: 60s
     networks: [rk]
+
+  # A second tracking server on the SAME backend store and artifact bucket,
+  # gated by MLflow's own basic auth instead of Cloudflare Access.
+  #
+  # Why it exists: the @mlflow/codex Node client can only send
+  # `Authorization: Bearer …` or HTTP Basic, so it cannot present the
+  # CF-Access-Client-Id/-Secret pair that gets a node past the Access
+  # application on ${MLFLOW_HOSTNAME}. Rather than punch a Bypass hole in that
+  # hostname (/api/* is full read AND write, including DELETE), non-browser
+  # clients that can't do Access get their own hostname with a real user model.
+  #
+  # Tracking servers are stateless over the shared SQL backend, so both
+  # processes serve the same runs, and `--app-name basic-auth` applies only
+  # here. rk-mlflow and its service tokens are untouched.
+  mlflow-auth:
+    container_name: rk-mlflow-auth
+    build:
+      context: .
+      dockerfile: docker/mlflow/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db: { condition: service_healthy }
+      storage: { condition: service_healthy }
+    # Renders basic_auth.ini from the environment into tmpfs before exec'ing
+    # the command below. MLflow reads admin_password and the auth database_uri
+    # only from that file (configparser, no env interpolation), so the
+    # alternative would be committing both secrets.
+    entrypoint: ["/usr/local/bin/auth-entrypoint.sh"]
+    environment:
+      MLFLOW_S3_ENDPOINT_URL: http://storage:5000/s3
+      AWS_ACCESS_KEY_ID: ${S3_PROTOCOL_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${S3_PROTOCOL_ACCESS_KEY_SECRET:-}
+      AWS_DEFAULT_REGION: ${REGION:-local}
+      AWS_S3_ADDRESSING_STYLE: path
+      MLFLOW_S3_IGNORE_TLS: "true"
+      # Under /dev/shm so the rendered secrets live in tmpfs only.
+      MLFLOW_AUTH_CONFIG_PATH: /dev/shm/mlflow-auth/basic_auth.ini
+      # The auth database is owned by the same `mlflow` role.
+      MLFLOW_DB_PASSWORD: ${MLFLOW_DB_PASSWORD:-}
+      MLFLOW_AUTH_ADMIN_PASSWORD: ${MLFLOW_AUTH_ADMIN_PASSWORD:-}
+      # Required by create_app() for CSRF; must be identical on every
+      # basic-auth server, so it is a variable rather than a generated value.
+      MLFLOW_FLASK_SERVER_SECRET_KEY: ${MLFLOW_FLASK_SERVER_SECRET_KEY:-}
+    command:
+      - mlflow
+      - server
+      # The same store and bucket as `mlflow` — that is the point.
+      - --backend-store-uri
+      - postgresql+psycopg2://mlflow:${MLFLOW_DB_PASSWORD:-}@db:5432/mlflow
+      - --serve-artifacts
+      - --artifacts-destination
+      - s3://${MLFLOW_BUCKET:-mlflow}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5000"
+      # The README's three-variables rule applies here too, with the NEW
+      # hostname: --app-name swaps the FastAPI app for the Flask one, but
+      # mlflow/server/__init__.py still runs init_security_middleware() on it,
+      # so an unlisted Host header 403s exactly as on the other service.
+      # The loopback entries carry :5001 — the PUBLISHED port, which is what a
+      # local client puts in the Host header. Matching is an exact compare, so
+      # the internal 5000 is irrelevant here.
+      - --allowed-hosts
+      - ${MLFLOW_AUTH_ALLOWED_HOSTS:-localhost,localhost:5001,127.0.0.1,127.0.0.1:5001}
+      - --cors-allowed-origins
+      - ${MLFLOW_AUTH_CORS_ORIGINS:-http://localhost:5001,http://127.0.0.1:5001}
+      - --workers
+      - ${MLFLOW_AUTH_WORKERS:-2}
+      # Users and permissions come from MLFLOW_AUTH_CONFIG_PATH.
+      - --app-name
+      - basic-auth
+      - --uvicorn-opts
+      - --timeout-keep-alive 120
+    ports:
+      # Loopback on 5001: `mlflow` already holds 5000, and the admin-only auth
+      # APIs are driven from this host, not through the tunnel.
+      - "${MLFLOW_AUTH_BIND_ADDR:-127.0.0.1}:${MLFLOW_AUTH_PORT:-5001}:5000"
+    healthcheck:
+      # /health is one of the three unauthenticated paths in the basic-auth app
+      # (with /static and /favicon.ico), so this needs no credentials — and it is
+      # also exempt from the Host check, so localhost:5000 is fine here even
+      # though it is deliberately absent from --allowed-hosts.
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:5000/health').read()"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    networks: [rk]
+    # Profiled, like studio and cloudflared, so plain `make up` is byte-for-byte
+    # the command it was before this service existed — the verl nodes depend on
+    # rk-mlflow and nothing here should change when it is recreated. It also
+    # means a fresh clone whose env/server.env lacks the basic-auth secrets still
+    # gets a working `make up`. Start it with `make up-auth`.
+    profiles: [auth]
 
   # ---------------------------------------------------------------- admin --
   # Studio is an admin console, not a visualization surface — MLflow is.

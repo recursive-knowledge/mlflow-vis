@@ -1,0 +1,34 @@
+; Template for MLflow's basic-auth config, rendered at container start by
+; auth-entrypoint.sh. The rendered copy lands in a tmpfs path inside the
+; container and is never written to the repo or an image layer.
+;
+; Rendering is not a convenience: mlflow.server.auth.config.read_auth_config()
+; reads this file with a plain configparser, which does no environment
+; interpolation, and it reads BOTH admin_password and the full database_uri
+; with required-key access. There is no MLFLOW_AUTH_ADMIN_PASSWORD variable in
+; MLflow 3.14 — the password only ever comes from this file — so the two
+; secrets have to arrive here somehow, and env -> render -> tmpfs keeps them
+; out of git and out of `docker history`.
+;
+; Placeholders are substituted by name from the environment via Python's
+; string.Template. Note that it treats every dollar sign as the start of a
+; placeholder, so this file must not contain a literal one.
+
+[mlflow]
+; NO_PERMISSIONS, not MLflow's own READ default: a user must be granted each
+; experiment explicitly. With READ, every account — including any future
+; non-browser client — would start able to read every experiment on the shared
+; backend store, which is the same store MLFLOW_HOSTNAME serves.
+default_permission = NO_PERMISSIONS
+
+; Users and permissions only. Tracking data stays in the `mlflow` database;
+; this one holds its own alembic_version_auth table and migrates on startup.
+; Same `mlflow` role, so the same password — a role has exactly one, and
+; supabase/init/99-mlflow.sql gives it ownership of both databases.
+database_uri = postgresql://mlflow:${MLFLOW_DB_PASSWORD}@db:5432/mlflow_auth
+
+; Created once, on first startup, by create_admin_user() — which is a no-op if
+; the user already exists. Changing this value later therefore does NOT rotate
+; the password; use the users/update-password API for that.
+admin_username = admin
+admin_password = ${MLFLOW_AUTH_ADMIN_PASSWORD}
